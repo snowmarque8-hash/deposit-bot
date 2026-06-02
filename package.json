@@ -12,6 +12,8 @@
     "discord-api-types": "^0.37.83",
     "googleapis": "^140.0.0",
     "dotenv": "^16.4.5",
-    "puppeteer": "^22.0.0"
+    "puppeteer": "^22.0.0",
+    "imap": "^0.8.19",
+    "mailparser": "^3.7.1"
   }
 }
