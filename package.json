@@ -1,0 +1,17 @@
+{
+  "name": "discord-deposit-bot",
+  "version": "4.0.0",
+  "description": "Discord bot with Gmail tracking, tickets, per-deposit codes, and DoorDash order reader",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.0",
+    "@discordjs/rest": "^2.3.0",
+    "discord-api-types": "^0.37.83",
+    "googleapis": "^140.0.0",
+    "dotenv": "^16.4.5",
+    "puppeteer": "^22.0.0"
+  }
+}
