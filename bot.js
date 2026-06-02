@@ -1,9 +1,9 @@
-// bot.js — Discord Deposit Bot | Tickets + Per-deposit codes + Gmail auto-tracking
+// bot.js — Discord Deposit Bot | Tickets + Codes + Multi-Gmail + Manual Confirm
 require('dotenv').config();
 
 const {
   Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder,
-  ChannelType, PermissionFlagsBits
+  ChannelType, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle
 } = require('discord.js');
 const { REST } = require('@discordjs/rest');
 const { Routes } = require('discord-api-types/v10');
@@ -14,11 +14,17 @@ const { createDepositCode, lookupCode, markPaid, getPendingForUser, getAllForUse
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
-const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID; // category where ticket channels go
+const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID;
 const CHECK_INTERVAL_MS = 60_000;
 const DB_FILE = './balances.json';
 const LOG_FILE = './transactions.json';
-const TICKETS_FILE = './tickets.json'; // maps depositCode -> channelId
+const TICKETS_FILE = './tickets.json';
+
+// Multiple Gmail accounts — comma separated in .env
+// GMAIL_CREDENTIALS_LIST={"creds1":...},{"creds2":...}
+// OR just use GMAIL_CREDENTIALS for a single account
+const EXTRA_GMAIL_CREDENTIALS = process.env.GMAIL_CREDENTIALS_2 ?? null;
+const EXTRA_GMAIL_CREDENTIALS_3 = process.env.GMAIL_CREDENTIALS_3 ?? null;
 
 const PLATFORM_STYLE = {
   PayPal:     { color: 0x003087, emoji: '🅿️' },
@@ -26,6 +32,7 @@ const PLATFORM_STYLE = {
   'Cash App': { color: 0x00D632, emoji: '💚' },
   Zelle:      { color: 0x6D1ED4, emoji: '💜' },
   Chime:      { color: 0x00C300, emoji: '🟢' },
+  Manual:     { color: 0x607D8B, emoji: '✅' },
 };
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
@@ -53,15 +60,13 @@ function loadTickets() {
   return JSON.parse(fs.readFileSync(TICKETS_FILE, 'utf8'));
 }
 function saveTickets(d) { fs.writeFileSync(TICKETS_FILE, JSON.stringify(d, null, 2)); }
-function saveTicket(code, channelId) {
-  const t = loadTickets(); t[code] = channelId; saveTickets(t);
+function saveTicket(code, channelId, discordId) {
+  const t = loadTickets();
+  t[code] = { channelId, discordId };
+  saveTickets(t);
 }
-function getTicketChannel(code) {
-  return loadTickets()[code] ?? null;
-}
-function removeTicket(code) {
-  const t = loadTickets(); delete t[code]; saveTickets(t);
-}
+function getTicketInfo(code) { return loadTickets()[code] ?? null; }
+function removeTicket(code) { const t = loadTickets(); delete t[code]; saveTickets(t); }
 
 // ── Slash commands ────────────────────────────────────────────────────────────
 const commands = [
@@ -83,7 +88,6 @@ const commands = [
     .setName('leaderboard')
     .setDescription('Top 10 balances'),
 
-  // Admin only
   new SlashCommandBuilder()
     .setName('withdraw')
     .setDescription('Deduct from a user balance (Admin)')
@@ -123,139 +127,196 @@ const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// ── Create a ticket channel ───────────────────────────────────────────────────
+// ── Confirm button row (shown in every ticket) ────────────────────────────────
+function makeConfirmRow(code) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`confirm_${code}`)
+      .setLabel('✅ Confirm Payment Manually')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`deny_${code}`)
+      .setLabel('❌ Cancel Ticket')
+      .setStyle(ButtonStyle.Danger),
+  );
+}
+
+// ── Create ticket channel ─────────────────────────────────────────────────────
 async function createTicketChannel(guild, user, deposit) {
   const category = TICKET_CATEGORY_ID ? guild.channels.cache.get(TICKET_CATEGORY_ID) : null;
-
   const channel = await guild.channels.create({
     name: `deposit-${user.username.toLowerCase()}-${deposit.code.toLowerCase()}`,
     type: ChannelType.GuildText,
     parent: category ?? undefined,
     permissionOverwrites: [
-      {
-        // Hide from everyone by default
-        id: guild.roles.everyone,
-        deny: [PermissionFlagsBits.ViewChannel],
-      },
-      {
-        // Only the user can see it
-        id: user.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
-      },
-      {
-        // Bot can see it
-        id: client.user.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels],
-      },
+      { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+      { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },
     ],
   });
-
-  saveTicket(deposit.code, channel.id);
+  saveTicket(deposit.code, channel.id, user.id);
   return channel;
 }
 
-// ── Close a ticket channel (with delay) ──────────────────────────────────────
+// ── Close ticket ──────────────────────────────────────────────────────────────
 async function closeTicket(code, channel, delayMs = 10000) {
-  await channel.send({
-    embeds: [new EmbedBuilder()
-      .setColor(0x607D8B)
-      .setTitle('🔒 Ticket Closing')
-      .setDescription(`This ticket will be deleted in **10 seconds**...`)
-      .setTimestamp()],
-  });
-
+  await channel.send({ embeds: [new EmbedBuilder()
+    .setColor(0x607D8B)
+    .setTitle('🔒 Ticket Closing')
+    .setDescription('This ticket will be deleted in **10 seconds**...')
+    .setTimestamp()] });
   setTimeout(async () => {
-    try {
-      await channel.delete();
-      removeTicket(code);
-    } catch (e) {
-      console.error('Failed to delete ticket channel:', e.message);
-    }
+    try { await channel.delete(); removeTicket(code); }
+    catch (e) { console.error('Failed to delete ticket:', e.message); }
   }, delayMs);
 }
 
-// ── Auto-deposit handler (called by Gmail monitor) ────────────────────────────
-async function handleAutoDeposit(payment) {
-  const { platform, amount, senderName, depositCode } = payment;
-  const style = PLATFORM_STYLE[platform] ?? { color: 0x888888, emoji: '💰' };
-
-  // ── No code ───────────────────────────────────────────────────────────────
-  if (!depositCode) {
-    console.log(`⚠️  Payment from "${senderName}" — no deposit code in memo.`);
-    return;
-  }
-
-  const deposit = lookupCode(depositCode);
-
-  // ── Unknown code ──────────────────────────────────────────────────────────
-  if (!deposit) {
-    console.log(`⚠️  Unknown code: ${depositCode}`);
-    return;
-  }
-
-  // ── Already paid ──────────────────────────────────────────────────────────
-  if (deposit.status === 'paid') {
-    console.log(`⚠️  Code ${depositCode} already used!`);
-    return;
-  }
-
-  // ── Valid! Mark paid + update balance ─────────────────────────────────────
-  markPaid(depositCode, { amount, platform, senderName });
+// ── Confirm deposit (shared logic used by auto + manual) ──────────────────────
+async function confirmDeposit(deposit, amount, platform, senderName, channel) {
+  markPaid(deposit.code, { amount, platform, senderName });
   const balanceKey = `discord_${deposit.discordId}`;
   const newBalance = addBalance(balanceKey, amount);
-  logTx({ type: 'auto_deposit', platform, senderName, discordId: deposit.discordId, depositCode, amount, newBalance });
-  console.log(`💰 Deposit confirmed! ${deposit.username} | ${depositCode} | $${amount} via ${platform}`);
+  logTx({ type: platform === 'Manual' ? 'manual_confirm' : 'auto_deposit', platform, senderName, discordId: deposit.discordId, depositCode: deposit.code, amount, newBalance });
 
-  // ── Post in the user's ticket channel ────────────────────────────────────
-  const ticketChannelId = getTicketChannel(depositCode);
+  const style = PLATFORM_STYLE[platform] ?? { color: 0x888888, emoji: '💰' };
+  await channel.send({
+    content: `<@${deposit.discordId}>`,
+    embeds: [new EmbedBuilder()
+      .setColor(style.color)
+      .setTitle(`${style.emoji} Payment Confirmed!`)
+      .setDescription('Your deposit has been received and your balance has been updated!')
+      .addFields(
+        { name: 'Platform', value: platform, inline: true },
+        { name: 'Amount', value: `$${amount.toFixed(2)}`, inline: true },
+        { name: 'New Balance', value: `$${newBalance.toFixed(2)}`, inline: true },
+        { name: 'Code', value: `\`${deposit.code}\``, inline: true },
+      )
+      .setFooter({ text: platform === 'Manual' ? '✅ Manually confirmed by admin' : '🤖 Auto-detected via Gmail' })
+      .setTimestamp()],
+  });
+
+  await closeTicket(deposit.code, channel);
+}
+
+// ── Auto-deposit handler ──────────────────────────────────────────────────────
+async function handleAutoDeposit(payment) {
+  const { platform, amount, senderName, depositCode } = payment;
+  if (!depositCode) { console.log(`⚠️  No code in memo from "${senderName}"`); return; }
+
+  const deposit = lookupCode(depositCode);
+  if (!deposit) { console.log(`⚠️  Unknown code: ${depositCode}`); return; }
+  if (deposit.status === 'paid') { console.log(`⚠️  Code ${depositCode} already used`); return; }
+
   const guild = client.guilds.cache.get(GUILD_ID);
+  const ticketInfo = getTicketInfo(depositCode);
+  const channel = ticketInfo ? guild?.channels.cache.get(ticketInfo.channelId) : null;
 
-  let ticketChannel = ticketChannelId ? guild?.channels.cache.get(ticketChannelId) : null;
-
-  if (ticketChannel) {
-    const amountWarning = deposit.expectedAmount && Math.abs(deposit.expectedAmount - amount) > 0.01
-      ? `\n⚠️ Expected $${deposit.expectedAmount.toFixed(2)} but received $${amount.toFixed(2)}`
-      : '';
-
-    await ticketChannel.send({
-      content: `<@${deposit.discordId}>`,
-      embeds: [new EmbedBuilder()
-        .setColor(style.color)
-        .setTitle(`${style.emoji} Payment Confirmed!`)
-        .setDescription(`Your deposit has been received and your balance has been updated!${amountWarning}`)
-        .addFields(
-          { name: 'Platform', value: platform, inline: true },
-          { name: 'Amount', value: `$${amount.toFixed(2)}`, inline: true },
-          { name: 'New Balance', value: `$${newBalance.toFixed(2)}`, inline: true },
-          { name: 'Code', value: `\`${depositCode}\``, inline: true },
-        )
-        .setFooter({ text: '🤖 Detected automatically via Gmail' })
-        .setTimestamp()],
-    });
-
-    // Auto close after 10 seconds
-    await closeTicket(depositCode, ticketChannel);
+  if (channel) {
+    await confirmDeposit(deposit, amount, platform, senderName, channel);
+  } else {
+    console.log(`⚠️  Ticket channel not found for ${depositCode} — balance updated anyway`);
+    markPaid(depositCode, { amount, platform, senderName });
+    addBalance(`discord_${deposit.discordId}`, amount);
+    logTx({ type: 'auto_deposit', platform, senderName, discordId: deposit.discordId, depositCode, amount });
   }
 }
 
-// ── Email polling ─────────────────────────────────────────────────────────────
-let gmailAuth = null;
-async function startEmailMonitor() {
+// ── Multi-Gmail polling ───────────────────────────────────────────────────────
+const gmailAuths = [];
+
+async function setupGmailAccount(credentialsJson, label) {
   try {
-    gmailAuth = await getGmailAuth();
-    console.log('📧 Gmail connected. Polling every 60s...');
-    await runEmailCheck();
-    setInterval(runEmailCheck, CHECK_INTERVAL_MS);
-  } catch (e) { console.error('❌ Gmail setup failed:', e.message); }
-}
-async function runEmailCheck() {
-  if (!gmailAuth) return;
-  try { await checkEmails(gmailAuth, handleAutoDeposit); }
-  catch (e) { console.error('Email check error:', e.message); }
+    const auth = await getGmailAuth(credentialsJson, label);
+    gmailAuths.push({ auth, label });
+    console.log(`📧 Gmail connected: ${label}`);
+  } catch (e) {
+    console.error(`❌ Gmail setup failed (${label}):`, e.message);
+  }
 }
 
-// ── Command handler ───────────────────────────────────────────────────────────
+async function startEmailMonitor() {
+  // Primary Gmail account
+  await setupGmailAccount(process.env.GMAIL_CREDENTIALS, 'Account 1');
+
+  // Extra Gmail accounts (optional)
+  if (EXTRA_GMAIL_CREDENTIALS) await setupGmailAccount(EXTRA_GMAIL_CREDENTIALS, 'Account 2');
+  if (EXTRA_GMAIL_CREDENTIALS_3) await setupGmailAccount(EXTRA_GMAIL_CREDENTIALS_3, 'Account 3');
+
+  if (gmailAuths.length === 0) {
+    console.error('❌ No Gmail accounts connected!');
+    return;
+  }
+
+  console.log(`📧 Monitoring ${gmailAuths.length} Gmail account(s). Polling every 60s...`);
+  await runEmailCheck();
+  setInterval(runEmailCheck, CHECK_INTERVAL_MS);
+}
+
+async function runEmailCheck() {
+  for (const { auth, label } of gmailAuths) {
+    try {
+      await checkEmails(auth, handleAutoDeposit);
+    } catch (e) {
+      console.error(`Email check error (${label}):`, e.message);
+    }
+  }
+}
+
+// ── Command + Button handler ──────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
+
+  // ── Button interactions ───────────────────────────────────────────────────
+  if (interaction.isButton()) {
+    const isAdmin = interaction.member.permissions.has('Administrator');
+    if (!isAdmin) return interaction.reply({ content: '❌ Only admins can use these buttons.', ephemeral: true });
+
+    const [action, ...codeParts] = interaction.customId.split('_');
+    const code = codeParts.join('_');
+
+    // ── ✅ Confirm button ─────────────────────────────────────────────────
+    if (action === 'confirm') {
+      const deposit = lookupCode(code);
+      if (!deposit) return interaction.reply({ content: '❌ Deposit code not found.', ephemeral: true });
+      if (deposit.status === 'paid') return interaction.reply({ content: '⚠️ Already confirmed!', ephemeral: true });
+
+      // Ask admin for amount
+      await interaction.reply({
+        content: `How much did they send? Reply with just the number (e.g. \`50\`) and the platform (e.g. \`PayPal\`)\nFormat: \`amount platform\`\nExample: \`50 PayPal\``,
+        ephemeral: true,
+      });
+
+      // Wait for admin's reply
+      const filter = m => m.author.id === interaction.user.id;
+      try {
+        const collected = await interaction.channel.awaitMessages({ filter, max: 1, time: 30_000, errors: ['time'] });
+        const parts = collected.first().content.trim().split(' ');
+        const amount = parseFloat(parts[0]);
+        const platform = parts[1] ?? 'Manual';
+
+        if (isNaN(amount) || amount <= 0) {
+          return interaction.followUp({ content: '❌ Invalid amount. Try again.', ephemeral: true });
+        }
+
+        await collected.first().delete().catch(() => {});
+        await confirmDeposit(deposit, amount, platform, 'Manual (Admin)', interaction.channel);
+      } catch {
+        return interaction.followUp({ content: '⏰ Timed out. Click the button again to retry.', ephemeral: true });
+      }
+    }
+
+    // ── ❌ Deny/Cancel button ─────────────────────────────────────────────
+    if (action === 'deny') {
+      await interaction.reply({ content: '🔒 Cancelling ticket in 10 seconds...', ephemeral: false });
+      const ticketInfo = getTicketInfo(code);
+      setTimeout(async () => {
+        try { await interaction.channel.delete(); removeTicket(code); }
+        catch (e) { console.error('Failed to close ticket:', e.message); }
+      }, 10000);
+    }
+
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
   const { commandName } = interaction;
 
@@ -263,37 +324,36 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'newdeposit') {
     const expectedAmount = interaction.options.getNumber('amount') ?? null;
     const deposit = createDepositCode(interaction.user.id, interaction.user.username, expectedAmount);
-
-    // Create private ticket channel
     const ticketChannel = await createTicketChannel(interaction.guild, interaction.user, deposit);
 
-    // Confirm to user (ephemeral so others don't see)
     await interaction.reply({
       content: `✅ Your deposit ticket has been created! Head to <#${ticketChannel.id}>`,
       ephemeral: true,
     });
 
-    // Post instructions inside the ticket
     await ticketChannel.send({
       content: `<@${interaction.user.id}>`,
       embeds: [new EmbedBuilder()
         .setColor(0x00C853)
         .setTitle('💰 Deposit Ticket')
-        .setDescription('Here is your **one-time deposit code**. Put it in the memo/note when you send your payment:')
+        .setDescription('Send your payment to any method below and **include your code in the memo/note**!')
         .addFields(
-          { name: '🔑 Your Code', value: `\`\`\`${deposit.code}\`\`\`` },
-          { name: '💵 Expected Amount', value: expectedAmount ? `$${expectedAmount.toFixed(2)}` : 'Any amount', inline: true },
+          { name: '💵 Amount', value: expectedAmount ? `$${expectedAmount.toFixed(2)}` : 'Any amount', inline: true },
           { name: '⏳ Status', value: 'Waiting for payment...', inline: true },
         )
-        .addFields({ name: '📋 Where to put the code', value:
-          `> **PayPal** → Note field: \`${deposit.code}\`\n` +
-          `> **Venmo** → Note field: \`${deposit.code}\`\n` +
-          `> **Cash App** → Note field: \`${deposit.code}\`\n` +
-          `> **Zelle** → Memo field: \`${deposit.code}\`\n` +
-          `> **Chime** → Note field: \`${deposit.code}\``
+        .addFields({ name: '💸 Where to Send', value:
+          `> 🅿️ **PayPal** → paypal.me/marquesnow816\n` +
+          `> 💙 **Venmo** → @cinnamonzeus488\n` +
+          `> 💚 **Cash App** → $snowmarque373\n` +
+          `> 💜 **Zelle** → 5627319025\n` +
+          `> 🟢 **Chime** → marque-snow`
         })
-        .setFooter({ text: 'This ticket will automatically close once your payment is confirmed.' })
+        .addFields({ name: '📋 Your One-Time Code — Put This in the Memo/Note', value:
+          `\`\`\`${deposit.code}\`\`\``
+        })
+        .setFooter({ text: 'This ticket closes automatically once payment is confirmed.' })
         .setTimestamp()],
+      components: [makeConfirmRow(deposit.code)],
     });
 
     return;
@@ -305,6 +365,7 @@ client.on('interactionCreate', async interaction => {
     const balance = getBalance(`discord_${targetUser.id}`);
     const pending = getPendingForUser(targetUser.id);
     return interaction.reply({
+      ephemeral: true,
       embeds: [new EmbedBuilder()
         .setColor(0x2196F3)
         .setTitle('💳 Balance')
@@ -315,28 +376,26 @@ client.on('interactionCreate', async interaction => {
           { name: 'Pending Deposits', value: `${pending.length}`, inline: true },
         )
         .setTimestamp()],
-      ephemeral: true,
     });
   }
 
   // ── /myhistory ────────────────────────────────────────────────────────────
   if (commandName === 'myhistory') {
     const all = getAllForUser(interaction.user.id);
-    if (!all.length) return interaction.reply({ content: 'No deposit history yet. Run `/newdeposit` to get started!', ephemeral: true });
+    if (!all.length) return interaction.reply({ content: 'No deposit history yet!', ephemeral: true });
     const lines = all.slice(0, 15).map(d => {
       const icon = d.status === 'paid' ? '✅' : '⏳';
       const amount = d.amount ? `$${d.amount.toFixed(2)}` : (d.expectedAmount ? `$${d.expectedAmount.toFixed(2)} expected` : 'Any');
       const date = d.status === 'paid' ? new Date(d.paidAt).toLocaleDateString() : `Created ${new Date(d.createdAt).toLocaleDateString()}`;
       return `${icon} \`${d.code}\` — ${amount} — ${d.platform ?? 'Pending'} — ${date}`;
     });
-    const balance = getBalance(`discord_${interaction.user.id}`);
     return interaction.reply({
       ephemeral: true,
       embeds: [new EmbedBuilder()
         .setColor(0x2196F3)
         .setTitle('📋 Your Deposit History')
         .setDescription(lines.join('\n'))
-        .addFields({ name: '💳 Current Balance', value: `$${balance.toFixed(2)}` })
+        .addFields({ name: '💳 Current Balance', value: `$${getBalance(`discord_${interaction.user.id}`).toFixed(2)}` })
         .setTimestamp()],
     });
   }
@@ -350,13 +409,11 @@ client.on('interactionCreate', async interaction => {
     const lines = sorted.map(([k, b], i) =>
       `${medals[i] ?? `**${i+1}.**`} <@${k.replace('discord_', '')}> — $${b.toFixed(2)}`
     );
-    return interaction.reply({
-      embeds: [new EmbedBuilder().setColor(0xFFD700)
-        .setTitle('🏆 Leaderboard').setDescription(lines.join('\n')).setTimestamp()],
-    });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFFD700)
+      .setTitle('🏆 Leaderboard').setDescription(lines.join('\n')).setTimestamp()] });
   }
 
-  // ── /withdraw (admin) ─────────────────────────────────────────────────────
+  // ── /withdraw ─────────────────────────────────────────────────────────────
   if (commandName === 'withdraw') {
     if (!interaction.member.permissions.has('Administrator'))
       return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
@@ -364,47 +421,40 @@ client.on('interactionCreate', async interaction => {
     const amount = interaction.options.getNumber('amount');
     const newBalance = addBalance(`discord_${targetUser.id}`, -amount);
     logTx({ type: 'withdraw', discordId: targetUser.id, amount, newBalance });
-    return interaction.reply({
-      embeds: [new EmbedBuilder().setColor(0xFF5722).setTitle('📤 Withdrawal')
-        .addFields(
-          { name: 'User', value: `<@${targetUser.id}>`, inline: true },
-          { name: 'Deducted', value: `$${amount.toFixed(2)}`, inline: true },
-          { name: 'New Balance', value: `$${newBalance.toFixed(2)}`, inline: true },
-        ).setTimestamp()],
-    });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFF5722).setTitle('📤 Withdrawal')
+      .addFields(
+        { name: 'User', value: `<@${targetUser.id}>`, inline: true },
+        { name: 'Deducted', value: `$${amount.toFixed(2)}`, inline: true },
+        { name: 'New Balance', value: `$${newBalance.toFixed(2)}`, inline: true },
+      ).setTimestamp()] });
   }
 
-  // ── /setbalance (admin) ───────────────────────────────────────────────────
+  // ── /setbalance ───────────────────────────────────────────────────────────
   if (commandName === 'setbalance') {
     if (!interaction.member.permissions.has('Administrator'))
       return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
     const targetUser = interaction.options.getUser('user');
     const amount = interaction.options.getNumber('amount');
     setBalance(`discord_${targetUser.id}`, amount);
-    return interaction.reply({
-      embeds: [new EmbedBuilder().setColor(0x9C27B0).setTitle('✏️ Balance Set')
-        .addFields({ name: `<@${targetUser.id}>`, value: `$${amount.toFixed(2)}` }).setTimestamp()],
-    });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x9C27B0).setTitle('✏️ Balance Set')
+      .addFields({ name: `<@${targetUser.id}>`, value: `$${amount.toFixed(2)}` }).setTimestamp()] });
   }
 
-  // ── /history (admin) ──────────────────────────────────────────────────────
+  // ── /history ──────────────────────────────────────────────────────────────
   if (commandName === 'history') {
     if (!interaction.member.permissions.has('Administrator'))
       return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
     const log = getLog(10);
     if (!log.length) return interaction.reply({ content: 'No transactions yet.', ephemeral: true });
     const lines = log.map(t => {
-      const icon = t.type.includes('deposit') ? '💚' : '🔴';
+      const icon = t.type.includes('deposit') || t.type === 'manual_confirm' ? '💚' : '🔴';
       return `${icon} <@${t.discordId}> | $${t.amount.toFixed(2)} | ${t.platform ?? 'Manual'} | \`${t.depositCode ?? '—'}\` | ${new Date(t.timestamp).toLocaleDateString()}`;
     });
-    return interaction.reply({
-      ephemeral: true,
-      embeds: [new EmbedBuilder().setColor(0x607D8B)
-        .setTitle('📋 Recent Transactions').setDescription(lines.join('\n')).setTimestamp()],
-    });
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(0x607D8B)
+      .setTitle('📋 Recent Transactions').setDescription(lines.join('\n')).setTimestamp()] });
   }
 
-  // ── /pending (admin) ──────────────────────────────────────────────────────
+  // ── /pending ──────────────────────────────────────────────────────────────
   if (commandName === 'pending') {
     if (!interaction.member.permissions.has('Administrator'))
       return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
@@ -413,18 +463,15 @@ client.on('interactionCreate', async interaction => {
     const lines = all.map(d =>
       `\`${d.code}\` — <@${d.discordId}> — ${d.expectedAmount ? `$${d.expectedAmount.toFixed(2)}` : 'Any'} — ${new Date(d.createdAt).toLocaleDateString()}`
     );
-    return interaction.reply({
-      ephemeral: true,
-      embeds: [new EmbedBuilder().setColor(0xFF9800)
-        .setTitle(`⏳ All Pending Codes (${all.length})`).setDescription(lines.join('\n')).setTimestamp()],
-    });
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setColor(0xFF9800)
+      .setTitle(`⏳ All Pending Codes (${all.length})`).setDescription(lines.join('\n')).setTimestamp()] });
   }
 
-  // ── /closeticket (admin manual close) ────────────────────────────────────
+  // ── /closeticket ──────────────────────────────────────────────────────────
   if (commandName === 'closeticket') {
     if (!interaction.member.permissions.has('Administrator'))
       return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
-    await interaction.reply({ content: '🔒 Closing ticket in 10 seconds...', ephemeral: false });
+    await interaction.reply({ content: '🔒 Closing ticket in 10 seconds...' });
     setTimeout(async () => {
       try { await interaction.channel.delete(); }
       catch (e) { console.error('Failed to close ticket:', e.message); }
@@ -433,7 +480,7 @@ client.on('interactionCreate', async interaction => {
 
   // ── /checkmail ────────────────────────────────────────────────────────────
   if (commandName === 'checkmail') {
-    await interaction.reply({ content: '📧 Checking Gmail now...', ephemeral: true });
+    await interaction.reply({ content: `📧 Checking ${gmailAuths.length} Gmail account(s) now...`, ephemeral: true });
     await runEmailCheck();
     return interaction.followUp({ content: '✅ Done!', ephemeral: true });
   }
