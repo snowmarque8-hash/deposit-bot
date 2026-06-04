@@ -5,8 +5,11 @@ const path = require('path');
 
 function run(name, file, cwd) {
   console.log(`▶ Starting ${name}...`);
-  // fork() reuses the same Node binary that's already running — no PATH lookup needed
-  const child = fork(file, [], { cwd, stdio: 'inherit' });
+  const child = fork(file, [], {
+    cwd,
+    stdio: 'inherit',
+    execPath: process.execPath,   // use the exact Node binary running this launcher
+  });
   child.on('exit', code => {
     console.log(`⚠ ${name} stopped (code ${code}). Restarting in 5s...`);
     setTimeout(() => run(name, file, cwd), 5000);
@@ -16,8 +19,5 @@ function run(name, file, cwd) {
   });
 }
 
-// Deposit bot (lives at repo root)
 run('Deposit Bot', path.join(__dirname, 'bot.js'), __dirname);
-
-// Resell bot (lives in the resell-bot subfolder)
 run('Resell Bot', path.join(__dirname, 'resell-bot', 'index.js'), path.join(__dirname, 'resell-bot'));
