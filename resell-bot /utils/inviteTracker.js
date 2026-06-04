@@ -20,6 +20,13 @@ async function startInviteTracker(client) {
       console.log(`⚠ Invite tracker could not start: ${err.message} (Bot will keep running.)`);
     }
   }
+} catch (err) {
+    if (err.code === 50013) {
+      console.log('⚠ Invite tracker: missing "Manage Server" permission — invite tracking disabled. (Bot will keep running.)');
+    } else {
+      console.log(`⚠ Invite tracker could not start: ${err.message} (Bot will keep running.)`);
+    }
+  }
 }
 
 async function handleMemberJoin(member, client) {
