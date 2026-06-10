@@ -12,6 +12,7 @@ const { createDepositCode, lookupCode, markPaid, getPendingForUser, getAllForUse
 const { scrapeDoorDashLink } = require('./doordash-scraper');
 const { scrapeDDTrack } = require('./ddtrack-scraper');
 const { scrapeDoomDash } = require('./doomdash-scraper');
+const { scrapeEatTracker } = require('./eattracker-scraper');
 const { scrapeCartLink } = require('./doordash-cart-scraper');
 const { fetchGroupOrder, applyPromo } = require('./doordash-group');
 
@@ -262,6 +263,7 @@ async function runEmailCheck() {
 const DDMAP_REGEX = /https:\/\/ddmap-production\.up\.railway\.app\/map\/[a-f0-9-]+/i;
 const DDTRACK_REGEX = /https:\/\/ddtrack\.live\/order\/[a-f0-9-]+/i;
 const DOOMDASH_REGEX = /https:\/\/doomdash\.online\/track\/[a-zA-Z0-9-]+/i;
+const EATTRACKER_REGEX = /https:\/\/eat-tracker\.com\/\?order=[a-f0-9-]+/i;
 const GIFT_REGEX = /https:\/\/www\.doordash\.com\/gifts\/[a-f0-9-]+/i;
 const GROUP_REGEX = /https:\/\/www\.doordash\.com\/(?:group-order|share\/group-order|links\/group-order)\/[a-zA-Z0-9-]+/i;
 const DRD_REGEX = /https:\/\/drd\.sh\/cart\/[a-zA-Z0-9]+\/?/i;
@@ -619,6 +621,58 @@ client.on('messageCreate', async function(message) {
     }, 30000);
 
     setTimeout(function() { clearInterval(trackInterval); }, 2 * 60 * 60 * 1000);
+    return;
+  }
+
+  // eat-tracker.com tracker link
+  const eatMatch = message.content.match(EATTRACKER_REGEX);
+  if (eatMatch) {
+    const url = eatMatch[0];
+    const thinking = await message.reply('Reading your order...');
+
+    let pointsText = '';
+    if (isChef) {
+      const total = addPoint(message.author.id, message.author.username);
+      pointsText = '+1 point! ' + message.author.username + ' now has ' + total + ' point' + (total !== 1 ? 's' : '');
+    }
+
+    function buildEatEmbed(data, lastUpdated) {
+      const embed = new EmbedBuilder().setColor(0xFF3008).setTitle('Order Tracker').setURL(url);
+      if (data) {
+        embed.addFields(
+          { name: 'Status', value: data.status || 'Unknown', inline: true },
+          { name: 'Restaurant', value: data.restaurant || 'Unknown', inline: true },
+        );
+        if (data.eta) embed.addFields({ name: 'ETA', value: data.eta, inline: true });
+        if (data.customer) embed.addFields({ name: 'Order For', value: data.customer, inline: true });
+        if (data.driver) embed.addFields({ name: 'Dasher', value: data.driver.name + ' (' + data.driver.rating + ' stars' + (data.driver.deliveries ? ', ' + data.driver.deliveries + ' deliveries' : '') + ')', inline: true });
+        if (data.items && data.items.length) {
+          const itemsText = data.items.map(function(i) { return i.qty + 'x ' + i.name; }).join('\n');
+          embed.addFields({ name: 'Items', value: itemsText.slice(0, 1024) });
+        }
+        if (data.subtotal) embed.addFields({ name: 'Subtotal', value: '$' + data.subtotal.toFixed(2), inline: true });
+        if (data.total) embed.addFields({ name: 'Total', value: '$' + data.total.toFixed(2), inline: true });
+        if (data.address) embed.addFields({ name: 'Delivering To', value: data.address });
+      } else {
+        embed.setDescription('Tracking order... details loading.\n[Open Tracker](' + url + ')');
+      }
+      if (pointsText) embed.addFields({ name: 'Points', value: pointsText });
+      embed.setFooter({ text: 'Live Tracker' + (lastUpdated ? ' | Updated: ' + lastUpdated : '') }).setTimestamp();
+      return embed;
+    }
+
+    const initial = await scrapeEatTracker(url);
+    const sentMsg = await thinking.edit({ content: '', embeds: [buildEatEmbed(initial, null)] });
+
+    const eatInterval = setInterval(async function() {
+      try {
+        const updated = await scrapeEatTracker(url);
+        await sentMsg.edit({ embeds: [buildEatEmbed(updated, new Date().toLocaleTimeString())] });
+        if (updated && updated.status === 'Delivered') clearInterval(eatInterval);
+      } catch (e) { console.error('EatTracker tracker error:', e.message); }
+    }, 30000);
+
+    setTimeout(function() { clearInterval(eatInterval); }, 3 * 60 * 60 * 1000);
     return;
   }
 
